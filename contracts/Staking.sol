@@ -17,33 +17,30 @@ contract Staking is Initializable, OwnableUpgradeable {
     using SafeCastUpgradeable for uint256;
 
     /// @notice Info of each user.
-    /// `amount` token amount the user has provided.
-    /// `scaledBalance` scaled balance of the user.
+    /// `amount` token amount the user has provided by calling `deposit`.
+    /// `share` share of the user in the reserve pool.
     /// `lastDepositedAt` The timestamp of the last deposit.
     struct UserInfo {
         uint256 amount;
-        uint256 scaledBalance;
+        uint256 share;
         uint256 lastDepositedAt;
     }
 
-    uint256 private constant ONE = 1e18;
-
     /// @notice Address of the staking token.
     IERC20Upgradeable public token;
-
-    /// @notice reward treasury wallet
-    address public rewardTreasury;
 
     /********************** Status ***********************/
 
     /// @notice Amount of reward token allocated per second
     uint256 public rewardPerSecond;
 
-    /// @notice reward index
-    uint256 public accRewardIndex;
+    /// @notice total shares
+    uint256 public totalShares;
 
     /// @notice total staked token amount
-    uint256 public totalStaked;
+    ///  - this includes the staked tokens of the user and the distributed rewards
+    ///  - this value should be always less than the total balance of the pool
+    uint256 public totalReserves;
 
     /// @notice Last time that the reward is calculated
     uint256 public lastRewardTime;
@@ -67,11 +64,9 @@ contract Staking is Initializable, OwnableUpgradeable {
     event Deposit(address indexed user, uint256 amount, address indexed to);
     event Withdraw(address indexed user, uint256 amount, address indexed to);
     event EmergencyWithdraw(address indexed user, uint256 amount, address indexed to);
-    event Claim(address indexed user, uint256 amount);
 
-    event LogUpdatePool(uint256 lastRewardTime, uint256 totalStaked, uint256 accRewardIndex);
+    event LogUpdatePool(uint256 lastRewardTime, uint256 totalReserves, uint256 totalShares);
     event LogRewardPerSecond(uint256 rewardPerSecond);
-    event LogRewardTreasury(address indexed treasury);
     event LogWithdrawTaxFee(uint256 taxFee);
     event LogPenaltyParams(uint256 earlyWithdrawal, uint256 penaltyRate);
 
@@ -86,7 +81,6 @@ contract Staking is Initializable, OwnableUpgradeable {
         __Ownable_init();
 
         token = _token;
-        accRewardIndex = ONE;
         lastRewardTime = block.timestamp;
 
         earlyWithdrawal = 7 days;
@@ -105,15 +99,6 @@ contract Staking is Initializable, OwnableUpgradeable {
     }
 
     /**
-     * @notice Sets reward treasury wallet address.
-     * @param _rewardTreasury treasury.
-     */
-    function setRewardTreasury(address _rewardTreasury) public onlyOwner {
-        rewardTreasury = _rewardTreasury;
-        emit LogRewardTreasury(_rewardTreasury);
-    }
-
-    /**
      * @notice Set the penalty information
      * @param _earlyWithdrawal The new earlyWithdrawal
      * @param _penaltyRate The new penaltyRate
@@ -122,16 +107,6 @@ contract Staking is Initializable, OwnableUpgradeable {
         earlyWithdrawal = _earlyWithdrawal;
         penaltyRate = _penaltyRate;
         emit LogPenaltyParams(_earlyWithdrawal, _penaltyRate);
-    }
-
-    /**
-     * @notice return available reward amount
-     * @return rewardInTreasury reward amount in treasury
-     * @return rewardAllowedForThisPool allowed reward amount to be spent by this pool
-     */
-    function availableReward() public view returns (uint256 rewardInTreasury, uint256 rewardAllowedForThisPool) {
-        rewardInTreasury = token.balanceOf(rewardTreasury);
-        rewardAllowedForThisPool = token.allowance(rewardTreasury, address(this));
     }
 
     /**
@@ -145,37 +120,46 @@ contract Staking is Initializable, OwnableUpgradeable {
 
     /**
      * @notice View function to see balance of a user.
-     * @dev It doens't update accRewardIndex, it's just a view function.
+     * @dev It doens't update anything, it's just a view function.
      *
-     *  user balance = user.scaledBalance * current index
+     *  user balance = user.share * totalReserves / totalShares
      *
      * @param _user Address of user.
-     * @return pending reward for a given user.
+     * @return balance of a given user.
      */
-    function pendingReward(address _user) external view returns (uint256 pending) {
-        UserInfo storage user = userInfo[_user];
-        uint256 accRewardIndex_ = accRewardIndex;
+    function balanceOf(address _user) external view returns (uint256 balance) {
+        UserInfo memory user = userInfo[_user];
+        balance = shareToReserve(user.share);
+    }
 
-        if (block.timestamp > lastRewardTime && totalStaked != 0) {
-            uint256 newReward = (block.timestamp - lastRewardTime) * rewardPerSecond;
-            accRewardIndex_ = accRewardIndex_ * (ONE + (newReward * ONE) / totalStaked) / ONE;
-        }
-        pending = user.scaledBalance * accRewardIndex_ / ONE - user.amount;
+    /**
+     * @notice View function to see reward of a user.
+     * @dev It doens't update anything, it's just a view function.
+     *
+     *  user balance = user.share * totalReserves / totalShares
+     *  user reward = user balance - last deposited amount
+     *
+     * @param _user Address of user.
+     * @return reward of a given user.
+     */
+    function rewardOf(address _user) external view returns (uint256 reward) {
+        UserInfo memory user = userInfo[_user];
+        uint256 balance = shareToReserve(user.share);
+        reward = balance > user.amount ? balance - user.amount : 0;
     }
 
     /**
      * @notice Update reward variables.
-     * @dev Updates accRewardIndex, totalStaked and lastRewardTime.
+     * @dev Updates totalReserves and lastRewardTime.
      */
     function updatePool() public {
         if (block.timestamp > lastRewardTime) {
-            if (totalStaked > 0) {
+            if (totalShares > 0) {
                 uint256 newReward = (block.timestamp - lastRewardTime) * rewardPerSecond;
-                accRewardIndex = accRewardIndex * (ONE + (newReward * ONE) / totalStaked) / ONE;
-                totalStaked = totalStaked + newReward;
+                totalReserves = totalReserves + newReward;
             }
             lastRewardTime = block.timestamp;
-            emit LogUpdatePool(lastRewardTime, totalStaked, accRewardIndex);
+            emit LogUpdatePool(lastRewardTime, totalReserves, totalShares);
         }
     }
 
@@ -189,10 +173,17 @@ contract Staking is Initializable, OwnableUpgradeable {
         UserInfo storage user = userInfo[to];
 
         // Effects
+        uint256 share;
+        if (totalShares > 0) {
+            share = reserveToShare(amount);
+        } else {
+            share = amount;
+        }
+        totalShares = totalShares + share;
+
+        user.share = user.share + share;
         user.lastDepositedAt = block.timestamp;
         user.amount = user.amount + amount;
-        totalStaked = totalStaked + amount;
-        user.scaledBalance = user.scaledBalance + amount * ONE / accRewardIndex;
 
         emit Deposit(msg.sender, amount, to);
 
@@ -201,59 +192,46 @@ contract Staking is Initializable, OwnableUpgradeable {
 
     /**
      * @notice Withdraw tokens and claim rewards to `to`.
+     * @dev if user is doing early withdrawal, then 50% of reward amount is deducted, reward is the amount that increased from the last stake
      * @param amount token amount to withdraw.
      * @param to Receiver of the tokens and rewards.
      */
     function withdraw(uint256 amount, address to) public {
         updatePool();
+        if (totalShares == 0 || totalReserves == 0) return;
+
         UserInfo storage user = userInfo[msg.sender];
-        uint256 balance = (user.scaledBalance * accRewardIndex) / ONE;
-        uint256 _pendingReward = balance - user.amount;
+        uint256 balance = shareToReserve(user.share);
+
+        // if early withdrawal, we decrease the user balance first
+        uint256 penaltyAmount;
+        uint256 reward = balance > user.amount ? balance - user.amount : 0;
+        if (isEarlyWithdrawal(user.lastDepositedAt)) {
+            penaltyAmount = reward * penaltyRate / 10000;
+            user.share = user.share - reserveToShare(penaltyAmount);
+            totalReserves = totalReserves - penaltyAmount;
+        }
+
+        // if the withdraw balance is larger than current available amount, then withdraws maximum
+        uint256 shareFromAmount = reserveToShare(amount);
+        if (shareFromAmount > user.share) {
+            shareFromAmount = user.share;
+            amount = shareToReserve(shareFromAmount);
+        }
 
         // Effects
-        user.scaledBalance = user.scaledBalance - (amount * ONE / accRewardIndex);
-        user.amount = user.amount - amount;
-        totalStaked = totalStaked - amount;
+        user.share = user.share - shareFromAmount;
+        totalReserves = totalReserves - amount;
+        user.amount = shareToReserve(user.share); // user's amount became the remaining balance, but no update to deposit time
 
         emit Withdraw(msg.sender, amount, to);
-        emit Claim(msg.sender, _pendingReward);
 
         // Interactions
-        if (isEarlyWithdrawal(user.lastDepositedAt)) {
-            uint256 penaltyAmount = _pendingReward * penaltyRate / 10000;
-            token.safeTransferFrom(rewardTreasury, to, _pendingReward - penaltyAmount);
-        } else {
-            token.safeTransferFrom(rewardTreasury, to, _pendingReward);
+        if (penaltyAmount > 0) {
+            // Burn the penalty amount
+            token.safeTransfer(address(0xdead), penaltyAmount);
         }
         token.safeTransfer(to, amount);
-    }
-
-    /**
-     * @notice Claim rewards and send to `to`.
-     * @dev Here comes the formula to calculate reward token amount
-     * @param to Receiver of rewards.
-     */
-    function claim(address to) public {
-        updatePool();
-        UserInfo storage user = userInfo[msg.sender];
-        uint256 balance = (user.scaledBalance * accRewardIndex) / ONE;
-        uint256 _pendingReward = balance - user.amount;
-
-        // Effects
-        user.scaledBalance = user.scaledBalance - (_pendingReward * ONE / accRewardIndex);
-        totalStaked = totalStaked - _pendingReward;
-
-        emit Claim(msg.sender, _pendingReward);
-
-        // Interactions
-        if (_pendingReward != 0) {
-            if (isEarlyWithdrawal(user.lastDepositedAt)) {
-                uint256 penaltyAmount = _pendingReward * penaltyRate / 10000;
-                token.safeTransferFrom(rewardTreasury, to, _pendingReward - penaltyAmount);
-            } else {
-                token.safeTransferFrom(rewardTreasury, to, _pendingReward);
-            }
-        }
     }
 
     /**
@@ -263,10 +241,10 @@ contract Staking is Initializable, OwnableUpgradeable {
     function emergencyWithdraw(address to) public {
         UserInfo storage user = userInfo[msg.sender];
         uint256 amount = user.amount;
-        uint256 balance = (user.scaledBalance * accRewardIndex) / ONE;
-        totalStaked = totalStaked - balance;
+        uint256 balance = shareToReserve(user.share);
+        totalReserves = totalReserves - balance;
         user.amount = 0;
-        user.scaledBalance = 0;
+        user.share = 0;
 
         emit EmergencyWithdraw(msg.sender, amount, to);
 
@@ -275,11 +253,45 @@ contract Staking is Initializable, OwnableUpgradeable {
     }
 
     /**
+     * @notice deposit reward
+     * @param amount to deposit
+     */
+    function depositReward(uint256 amount) external onlyOwner {
+        token.safeTransferFrom(msg.sender, address(this), amount);
+    }
+
+    /**
+     * @notice withdraw reward
+     * @param amount to withdraw
+     */
+    function withdrawReward(uint256 amount) external onlyOwner {
+        token.safeTransfer(msg.sender, amount);
+    }
+
+    /**
      * @notice check if user in penalty period
      * @return isEarly
      */
     function isEarlyWithdrawal(uint256 lastDepositedTime) internal view returns (bool isEarly) {
         isEarly = block.timestamp <= lastDepositedTime + earlyWithdrawal;
+    }
+
+    /**
+     * @notice convert share amount to reserve balance
+     * @param share if user in penalty period
+     * @return balance
+     */
+    function shareToReserve(uint256 share) internal view returns (uint256 balance) {
+        balance = totalShares > 0 ? share * totalReserves / totalShares : 0;
+    }
+
+    /**
+     * @notice convert reserve amount to share
+     * @param reserve if user in penalty period
+     * @return share
+     */
+    function reserveToShare(uint256 reserve) internal view returns (uint256 share) {
+        share = totalReserves > 0 ? reserve * totalShares / totalReserves : 0;
     }
 
     function renounceOwnership() public override onlyOwner {
