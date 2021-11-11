@@ -223,6 +223,7 @@ contract Staking is Initializable, OwnableUpgradeable {
             penaltyAmount = reward * penaltyRate / 10000;
             uint256 penaltyShare = reserveToShare(penaltyAmount);
             user.share = user.share - penaltyShare;
+            
             totalShares = totalShares - penaltyShare;
             totalReserves = totalReserves - penaltyAmount;
         }
@@ -236,9 +237,10 @@ contract Staking is Initializable, OwnableUpgradeable {
 
         // Effects
         user.share = user.share - shareFromAmount;
-        totalReserves = totalReserves - amount;
-        totalShares = totalShares - shareFromAmount;
         user.amount = shareToReserve(user.share); // user's amount became the remaining balance, but no update to deposit time
+
+        totalShares = totalShares - shareFromAmount;
+        totalReserves = totalReserves - amount;
 
         emit Withdraw(msg.sender, amount, to);
 
@@ -259,6 +261,7 @@ contract Staking is Initializable, OwnableUpgradeable {
         uint256 amount = user.amount;
         uint256 balance = shareToReserve(user.share);
         totalReserves = totalReserves - balance;
+        totalShares = totalShares - user.share;
         user.amount = 0;
         user.share = 0;
 
