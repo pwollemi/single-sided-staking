@@ -16,19 +16,16 @@ import {
 import { deployContract, deployProxy } from "../helper/deployer";
 
 chai.use(solidity);
-const { expect } = chai;
+const { expect, assert } = chai;
 
 describe("Staking Pool", () => {
   const totalSupply = getBigNumber("100000000");
-  const totalAmount = getBigNumber("20000000");
-  const totalRewardAmount = getBigNumber("2500000");
 
   // to avoid complex calculation of decimals, we set an easy value
   const rewardPerSecond = BigNumber.from("100000000000000000");
 
   let staking: Staking;
-  let lpToken: CustomToken;
-  let rewardToken: CustomToken;
+  let token: CustomToken;
 
   let deployer: SignerWithAddress;
   let bob: SignerWithAddress;
@@ -39,7 +36,7 @@ describe("Staking Pool", () => {
   });
 
   beforeEach(async () => {
-    lpToken = <CustomToken>(
+    token = <CustomToken>(
       await deployContract(
         "CustomToken",
         "Reward-USDC QS LP token",
@@ -47,32 +44,18 @@ describe("Staking Pool", () => {
         totalSupply
       )
     );
-    rewardToken = <CustomToken>(
-      await deployContract("CustomToken", "Reward token", "REWARD", totalSupply)
-    );
     staking = <Staking>(
       await deployProxy(
         "Staking",
-        rewardToken.address,
-        lpToken.address,
+        token.address,
       )
     );
 
     await staking.setRewardPerSecond(rewardPerSecond);
-    await staking.setRewardTreasury(deployer.address);
-
-    await rewardToken.approve(staking.address, ethers.constants.MaxUint256);
-
-    await lpToken.transfer(bob.address, totalAmount.div(5));
-    await lpToken.transfer(alice.address, totalAmount.div(5));
-
-    await lpToken.approve(staking.address, ethers.constants.MaxUint256);
-    await lpToken
-      .connect(bob)
-      .approve(staking.address, ethers.constants.MaxUint256);
-    await lpToken
-      .connect(alice)
-      .approve(staking.address, ethers.constants.MaxUint256);
+    await token.transfer(staking.address, totalSupply.div(2));
+    await token.approve(staking.address, ethers.constants.MaxUint256);
+    await token.connect(bob).approve(staking.address, ethers.constants.MaxUint256);
+    await token.connect(alice).approve(staking.address, ethers.constants.MaxUint256);
   });
 
   describe("initialize", async () => {
@@ -82,16 +65,8 @@ describe("Staking Pool", () => {
         deployProxy(
           "Staking",
           ethers.constants.AddressZero,
-          lpToken.address,
         )
-      ).to.be.revertedWith("initialize: reward token address cannot be zero");
-      await expect(
-        deployProxy(
-          "Staking",
-          rewardToken.address,
-          ethers.constants.AddressZero,
-        )
-      ).to.be.revertedWith("initialize: LP token address cannot be zero");
+      ).to.be.revertedWith("initialize: token address cannot be zero");
     });
   });
 
@@ -135,22 +110,58 @@ describe("Staking Pool", () => {
     });
   });
 
-  describe("PendingReward", () => {
+  describe("Balance of user", () => {
     it("Should be zero when lp supply is zero", async () => {
       await staking.deposit(getBigNumber(0), alice.address);
       await advanceTime(86400);
       await staking.updatePool();
-      expect(await staking.pendingReward(alice.address)).to.be.equal(0);
+      expect(await staking.balanceOf(alice.address)).to.be.equal(0);
     });
 
-    it("PendingRward should equal ExpectedReward", async () => {
-      await staking.deposit(getBigNumber(1), alice.address);
+    it("Balance of the user gradually increases by auto compounding", async () => {
+      const aliceDeposit = getBigNumber(1);
+      await staking.deposit(aliceDeposit, alice.address);
       await advanceTime(86400);
       await mineBlock();
-      const expectedReward = rewardPerSecond.mul(86400);
-      expect(await staking.pendingReward(alice.address)).to.be.equal(
-        expectedReward
-      );
+      const expectedBalance = aliceDeposit.add(rewardPerSecond.mul(86400));
+      expect(await staking.balanceOf(alice.address)).to.be.equal(expectedBalance);
+
+      // stake 1/4 of alice's current balance, thus 1/5 of total shares
+      const nextReserve = expectedBalance.add(rewardPerSecond.mul(10));
+      await advanceTime(10);
+      await staking.deposit(nextReserve.div(4), bob.address);
+      await advanceTime(86400);
+      await mineBlock();
+      const expectedAliceBalance = nextReserve.add(rewardPerSecond.mul(86400).mul(4).div(5));
+      const expectedBobBalance = nextReserve.div(4).add(rewardPerSecond.mul(86400).div(5));
+      expect(await staking.balanceOf(alice.address)).to.be.equal(expectedAliceBalance);
+      expect(await staking.balanceOf(bob.address)).to.be.equal(expectedBobBalance);
+    });
+  });
+
+  describe("Total reserves", () => {
+    it("Total reserve is updated by the time goes", async () => {
+      expect(await staking.totalReservesCurrent()).to.be.equal(0);
+      await staking.deposit(getBigNumber(1), alice.address);
+      const start = await getLatestBlockTimestamp();
+      await advanceTime(86400);
+      await mineBlock();
+      expect(await staking.totalReservesCurrent()).to.be.equal(getBigNumber(1).add(rewardPerSecond.mul(86400)));
+      await staking.deposit(getBigNumber(1), bob.address);
+      await advanceTime(86400);
+      await mineBlock();
+      const now = await getLatestBlockTimestamp();
+      expect(await staking.totalReservesCurrent()).to.be.equal(getBigNumber(2).add(rewardPerSecond.mul(now - start)));
+    });
+
+    it("Total reserve is always zero if zero staked", async () => {
+      expect(await staking.totalReservesCurrent()).to.be.equal(0);
+      await advanceTime(86400);
+      await mineBlock();
+      expect(await staking.totalReservesCurrent()).to.be.equal(0);
+      await advanceTime(86400);
+      await mineBlock();
+      expect(await staking.totalReservesCurrent()).to.be.equal(0);
     });
   });
 
@@ -162,59 +173,61 @@ describe("Staking Pool", () => {
         .to.emit(staking, "LogUpdatePool")
         .withArgs(
           await staking.lastRewardTime(),
-          await lpToken.balanceOf(staking.address),
-          await staking.accRewardPerShare()
+          await staking.totalReserves(),
+          await staking.totalShares()
         );
-    });
-  });
-
-  describe("Claim", () => {
-    it("Should give back the correct amount of REWARD", async () => {
-      const period = duration.days(31).toNumber();
-      const expectedReward = rewardPerSecond.mul(period);
-
-      await staking.deposit(getBigNumber(1), alice.address);
-      await advanceTime(period);
-      await staking.connect(alice).claim(alice.address);
-
-      expect(await rewardToken.balanceOf(alice.address)).to.be.equal(
-        expectedReward
-      );
-      expect((await staking.userInfo(alice.address)).rewardDebt).to.be.equal(
-        expectedReward
-      );
-      expect(await staking.pendingReward(alice.address)).to.be.equal(0);
-    });
-
-    it("Claim with empty user balance", async () => {
-      await staking.connect(alice).claim(alice.address);
     });
   });
 
   describe("Withdraw", () => {
     it("Should give back the correct amount of lp token and claim rewards(withdraw whole amount)", async () => {
+      // assume alice's current balance is zero
+      assert((await token.balanceOf(alice.address)).isZero());
+
       const depositAmount = getBigNumber(1);
+      const withdrawAmount = getBigNumber(2);
       const period = duration.days(31).toNumber();
       const expectedReward = rewardPerSecond.mul(period);
 
+      // 1. deposit tokens
       await staking.deposit(depositAmount, alice.address);
       await advanceTime(period);
-      const balance0 = await lpToken.balanceOf(alice.address);
+      await mineBlock();
+
+      // 2. check reward of the user
+      const rewardOf = await staking.rewardOf(alice.address);
+      expect(rewardOf).to.be.equal(expectedReward);
+
+      // 3. withdraw user (!!!! 10 more second has passed)
+      await advanceTime(10);
+      await staking.connect(alice).withdraw(withdrawAmount, alice.address);
+      expect(await token.balanceOf(alice.address)).to.be.equal(withdrawAmount);
+
+      // 4. remaining balances are depositAmount + rewardOf + 10 seconds rewards - withdrawAmount
+      expect(await staking.balanceOf(alice.address)).to.be.equal(rewardOf.add(depositAmount).add(rewardPerSecond.mul(10)).sub(withdrawAmount));
+    });
+
+    it("Penalty applied", async () => {
+      // assume alice's current balance is zero
+      assert((await token.balanceOf(alice.address)).isZero());
+
+      // 50 % penalty in 20 days
+      await staking.setPenaltyInfo(duration.days(20), 5000);
+
+      const depositAmount = getBigNumber(1);
+      const period = duration.days(10).toNumber();
+
+      await staking.deposit(depositAmount, alice.address);
+      await advanceTime(period);
       await staking.connect(alice).withdraw(depositAmount, alice.address);
-      const balance1 = await lpToken.balanceOf(alice.address);
 
-      expect(depositAmount).to.be.equal(balance1.sub(balance0));
-      expect(await rewardToken.balanceOf(alice.address)).to.be.equal(
-        expectedReward
-      );
-
-      // remainging reward should be zero
-      expect(await staking.pendingReward(alice.address)).to.be.equal(0);
-      // remaing debt should be zero
-      expect((await staking.userInfo(alice.address)).rewardDebt).to.be.equal(0);
+      // remaining balances are half of rewards
+      const remainingBalance = rewardPerSecond.mul(period).div(2);
+      expect(await staking.balanceOf(alice.address)).to.be.equal(remainingBalance);
     });
 
     it("Withraw 0", async () => {
+      await staking.deposit(getBigNumber(1), alice.address);
       await expect(staking.connect(alice).withdraw(0, bob.address))
         .to.emit(staking, "Withdraw")
         .withArgs(alice.address, 0, bob.address);

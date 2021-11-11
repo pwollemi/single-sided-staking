@@ -119,6 +119,18 @@ contract Staking is Initializable, OwnableUpgradeable {
     }
 
     /**
+     * @notice Total reserves.
+     * @return newReserve current reserve.
+     */
+    function totalReservesCurrent() public view returns (uint256 newReserve) {
+        newReserve = totalReserves;
+        if (block.timestamp > lastRewardTime && totalShares > 0) {
+            uint256 newReward = (block.timestamp - lastRewardTime) * rewardPerSecond;
+            newReserve = newReserve + newReward;
+        }
+    }
+
+    /**
      * @notice View function to see balance of a user.
      * @dev It doens't update anything, it's just a view function.
      *
@@ -129,7 +141,7 @@ contract Staking is Initializable, OwnableUpgradeable {
      */
     function balanceOf(address _user) external view returns (uint256 balance) {
         UserInfo memory user = userInfo[_user];
-        balance = shareToReserve(user.share);
+        balance = totalShares > 0 ? user.share * totalReservesCurrent() / totalShares : 0;
     }
 
     /**
@@ -144,7 +156,7 @@ contract Staking is Initializable, OwnableUpgradeable {
      */
     function rewardOf(address _user) external view returns (uint256 reward) {
         UserInfo memory user = userInfo[_user];
-        uint256 balance = shareToReserve(user.share);
+        uint256 balance = totalShares > 0 ? user.share * totalReservesCurrent() / totalShares : 0;
         reward = balance > user.amount ? balance - user.amount : 0;
     }
 
@@ -180,6 +192,7 @@ contract Staking is Initializable, OwnableUpgradeable {
             share = amount;
         }
         totalShares = totalShares + share;
+        totalReserves = totalReserves + amount;
 
         user.share = user.share + share;
         user.lastDepositedAt = block.timestamp;
@@ -208,7 +221,9 @@ contract Staking is Initializable, OwnableUpgradeable {
         uint256 reward = balance > user.amount ? balance - user.amount : 0;
         if (isEarlyWithdrawal(user.lastDepositedAt)) {
             penaltyAmount = reward * penaltyRate / 10000;
-            user.share = user.share - reserveToShare(penaltyAmount);
+            uint256 penaltyShare = reserveToShare(penaltyAmount);
+            user.share = user.share - penaltyShare;
+            totalShares = totalShares - penaltyShare;
             totalReserves = totalReserves - penaltyAmount;
         }
 
@@ -222,6 +237,7 @@ contract Staking is Initializable, OwnableUpgradeable {
         // Effects
         user.share = user.share - shareFromAmount;
         totalReserves = totalReserves - amount;
+        totalShares = totalShares - shareFromAmount;
         user.amount = shareToReserve(user.share); // user's amount became the remaining balance, but no update to deposit time
 
         emit Withdraw(msg.sender, amount, to);
